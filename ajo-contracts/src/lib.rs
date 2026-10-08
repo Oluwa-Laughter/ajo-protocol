@@ -195,7 +195,7 @@ impl AjoContract {
         }
 
         let expected_pot = circle.amount * (circle.members.len() as i128);
-        if round.total_collected < expected_pot {
+        if round.total_collected != expected_pot {
             return Err(ContractError::RoundNotComplete);
         }
 

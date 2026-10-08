@@ -373,3 +373,74 @@ fn test_creating_multiple_circles_assigns_distinct_ids() {
     assert_eq!(client.get_circle(&first).status, CircleStatus::Created);
     assert_eq!(client.get_circle(&second).status, CircleStatus::Created);
 }
+
+#[test]
+fn test_payout_requires_complete_pot_and_preserves_balances_on_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let member = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, token_client, token_admin_client) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register_contract(None, AjoContract);
+    let client = AjoContractClient::new(&env, &contract_id);
+    let amount = 50_000_000i128;
+    let circle_id = client.create_circle(&admin, &token_address, &amount, &3600, &2);
+    client.join(&circle_id, &member);
+    client.start(&circle_id);
+    token_admin_client.mint(&admin, &amount);
+    token_admin_client.mint(&member, &amount);
+
+    assert_eq!(client.try_payout(&circle_id), Err(Ok(ContractError::RoundNotComplete)));
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(token_client.balance(&admin), amount);
+    client.contribute(&circle_id, &admin);
+    assert_eq!(client.get_round(&circle_id, &0).total_collected, amount);
+    assert_eq!(client.try_payout(&circle_id), Err(Ok(ContractError::RoundNotComplete)));
+    assert_eq!(token_client.balance(&contract_id), amount);
+    assert_eq!(token_client.balance(&admin), 0);
+    assert_eq!(token_client.balance(&member), amount);
+    assert!(!client.get_round(&circle_id, &0).is_settled);
+    assert_eq!(client.get_circle(&circle_id).current_round, 0);
+}
+
+#[test]
+fn test_payout_transfers_full_pot_to_ordered_recipient_across_rounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let member = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, token_client, token_admin_client) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register_contract(None, AjoContract);
+    let client = AjoContractClient::new(&env, &contract_id);
+    let amount = 40_000_000i128;
+    let pot = amount * 2;
+    let circle_id = client.create_circle(&admin, &token_address, &amount, &3600, &2);
+    client.join(&circle_id, &member);
+    token_admin_client.mint(&admin, &(amount * 2));
+    token_admin_client.mint(&member, &(amount * 2));
+    client.start(&circle_id);
+
+    for round_id in 0..2u32 {
+        client.contribute(&circle_id, &admin);
+        client.contribute(&circle_id, &member);
+        assert_eq!(client.get_round(&circle_id, &round_id).total_collected, pot);
+        assert_eq!(token_client.balance(&contract_id), pot);
+        let admin_before = token_client.balance(&admin);
+        let member_before = token_client.balance(&member);
+        client.payout(&circle_id);
+        assert_eq!(token_client.balance(&contract_id), 0);
+        let admin_change = token_client.balance(&admin) - admin_before;
+        let member_change = token_client.balance(&member) - member_before;
+        if round_id == 0 {
+            assert_eq!(admin_change, pot);
+            assert_eq!(member_change, 0);
+        } else {
+            assert_eq!(admin_change, 0);
+            assert_eq!(member_change, pot);
+        }
+        assert!(client.get_round(&circle_id, &round_id).is_settled);
+    }
+    assert_eq!(client.get_circle(&circle_id).status, CircleStatus::Completed);
+}

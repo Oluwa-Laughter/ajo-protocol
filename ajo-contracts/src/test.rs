@@ -2,7 +2,7 @@
 
 use crate::{errors::ContractError, types::CircleStatus, AjoContract, AjoContractClient};
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger},
     token, Address, Env,
 };
 
@@ -38,15 +38,33 @@ fn test_create_circle_and_join() {
     assert_eq!(circle_id, 1);
 
     let circle = client.get_circle(&circle_id);
+    assert_eq!(circle.id, circle_id);
     assert_eq!(circle.admin, admin);
+    assert_eq!(circle.token, token_address);
+    assert_eq!(circle.amount, amount);
+    assert_eq!(circle.period_secs, period_secs);
+    assert_eq!(circle.max_members, max_members);
     assert_eq!(circle.members.len(), 1);
+    assert_eq!(circle.members.get(0), Some(admin.clone()));
     assert_eq!(circle.status, CircleStatus::Created);
+    assert_eq!(circle.current_round, 0);
+    assert_eq!(circle.round_start_time, 0);
+    assert_eq!(circle.payout_order.len(), 0);
+
+    let initial_round = client.get_round(&circle_id, &0);
+    assert_eq!(initial_round.circle_id, circle_id);
+    assert_eq!(initial_round.round_id, 0);
+    assert_eq!(initial_round.total_collected, 0);
+    assert_eq!(initial_round.paid_members.len(), 0);
+    assert!(!initial_round.is_settled);
 
     // Member 1 joins
     client.join(&circle_id, &member1);
 
     let circle_after_join = client.get_circle(&circle_id);
     assert_eq!(circle_after_join.members.len(), 2);
+    assert_eq!(circle_after_join.members.get(1), Some(member1));
+    assert_eq!(circle_after_join.status, CircleStatus::Created);
 }
 
 #[test]
@@ -137,6 +155,10 @@ fn test_invalid_creation_params() {
     // Amount <= 0 must fail
     let res1 = client.try_create_circle(&admin, &token_address, &0, &86400, &2);
     assert_eq!(res1, Err(Ok(ContractError::InvalidAmount)));
+
+    // Period must be nonzero
+    let res_period = client.try_create_circle(&admin, &token_address, &50_000_000, &0, &2);
+    assert_eq!(res_period, Err(Ok(ContractError::InvalidPeriod)));
 
     // Max members < 2 must fail
     let res2 = client.try_create_circle(&admin, &token_address, &50_000_000, &86400, &1);
@@ -236,4 +258,118 @@ fn test_full_circle_lifecycle() {
     // Circle should now be Completed
     let final_circle = client.get_circle(&circle_id);
     assert_eq!(final_circle.status, CircleStatus::Completed);
+}
+
+#[test]
+fn test_join_rejects_duplicate_member_and_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let member = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register_contract(None, AjoContract);
+    let client = AjoContractClient::new(&env, &contract_id);
+
+    let circle_id = client.create_circle(&admin, &token_address, &100, &60, &3);
+    assert_eq!(
+        client.try_join(&circle_id, &admin),
+        Err(Ok(ContractError::AlreadyJoined))
+    );
+    client.join(&circle_id, &member);
+    assert_eq!(
+        client.try_join(&circle_id, &member),
+        Err(Ok(ContractError::AlreadyJoined))
+    );
+
+    let circle = client.get_circle(&circle_id);
+    assert_eq!(circle.members.len(), 2);
+    assert_eq!(circle.members.get(0), Some(admin));
+    assert_eq!(circle.members.get(1), Some(member));
+}
+
+#[test]
+fn test_join_rejects_member_when_circle_is_full() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let member = Address::generate(&env);
+    let extra = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register_contract(None, AjoContract);
+    let client = AjoContractClient::new(&env, &contract_id);
+
+    let circle_id = client.create_circle(&admin, &token_address, &100, &60, &2);
+    client.join(&circle_id, &member);
+    assert_eq!(
+        client.try_join(&circle_id, &extra),
+        Err(Ok(ContractError::CircleFull))
+    );
+
+    let circle = client.get_circle(&circle_id);
+    assert_eq!(circle.members.len(), 2);
+    assert_eq!(circle.members.get(0), Some(admin));
+    assert_eq!(circle.members.get(1), Some(member));
+}
+
+#[test]
+fn test_start_activates_circle_and_preserves_join_order() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|ledger| ledger.timestamp = 123_456);
+
+    let admin = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register_contract(None, AjoContract);
+    let client = AjoContractClient::new(&env, &contract_id);
+
+    let circle_id = client.create_circle(&admin, &token_address, &100, &60, &3);
+    client.join(&circle_id, &member1);
+    client.join(&circle_id, &member2);
+
+    assert_eq!(client.get_circle(&circle_id).status, CircleStatus::Created);
+    client.start(&circle_id);
+
+    let circle = client.get_circle(&circle_id);
+    assert_eq!(circle.status, CircleStatus::Active);
+    assert_eq!(circle.current_round, 0);
+    assert_eq!(circle.round_start_time, 123_456);
+    assert_eq!(circle.payout_order, circle.members);
+    assert_eq!(circle.payout_order.get(0), Some(admin));
+    assert_eq!(circle.payout_order.get(1), Some(member1));
+    assert_eq!(circle.payout_order.get(2), Some(member2));
+
+    assert_eq!(
+        client.try_start(&circle_id),
+        Err(Ok(ContractError::AlreadyStarted))
+    );
+    assert_eq!(client.get_circle(&circle_id), circle);
+}
+
+#[test]
+fn test_creating_multiple_circles_assigns_distinct_ids() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register_contract(None, AjoContract);
+    let client = AjoContractClient::new(&env, &contract_id);
+
+    let first = client.create_circle(&admin, &token_address, &100, &60, &2);
+    let second = client.create_circle(&admin, &token_address, &200, &120, &3);
+
+    assert_eq!(first, 1);
+    assert_eq!(second, 2);
+    assert_eq!(client.get_circle(&first).amount, 100);
+    assert_eq!(client.get_circle(&second).amount, 200);
+    assert_eq!(client.get_circle(&first).status, CircleStatus::Created);
+    assert_eq!(client.get_circle(&second).status, CircleStatus::Created);
 }

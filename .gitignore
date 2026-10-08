@@ -1,0 +1,19 @@
+# Dependencies & Build Artifacts
+node_modules/
+.next/
+out/
+target/
+*.wasm
+.env
+.env.local
+.env*.local
+
+# OS & IDE Files
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Local Roadmap (Maintainer Only - Keep internal)
+AGENDA.md
+**/AGENDA.md
